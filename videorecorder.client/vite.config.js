@@ -44,6 +44,7 @@ export default defineConfig({
         plugin(),
         // 🔽 PWA plugin (additive; keeps your SSL/proxy intact)
         VitePWA({
+            injectRegister: 'auto',
             registerType: 'autoUpdate',
             devOptions: { enabled: true }, // SW in dev so you can test install/offline
             includeAssets: ['robots.txt', 'favicon.svg'],

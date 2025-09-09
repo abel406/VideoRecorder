@@ -3,7 +3,8 @@ import { useDisclosure } from '@mantine/hooks';
 import { Link, Navigate, Route, Routes, useLocation } from 'react-router-dom';
 import Recorder from './features/recorder/Recorder.jsx';
 import Library from './features/library/Library.jsx';
-import ThemeToggle from './features/theme/ThemeToggle'
+import ThemeToggle from './features/theme/ThemeToggle';
+import InstallButton from './features/pwa/InstallButton.jsx'
 
 export default function App() {
     const [opened, { toggle }] = useDisclosure();
@@ -27,6 +28,12 @@ export default function App() {
 
                         <Group>
                             <ThemeToggle />
+                        </Group>
+                        <Group h="100%" px="md" justify="space-between">
+                            {/*<Group>
+                                */}{/**/}{/*
+                            </Group>*/}
+                            <InstallButton />
                         </Group>
                     </Group>
             </AppShell.Header>
