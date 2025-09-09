@@ -1,0 +1,6 @@
+@VideoRecorder.Server_HostAddress = http://localhost:5193
+
+GET {{VideoRecorder.Server_HostAddress}}/weatherforecast/
+Accept: application/json
+
+###
