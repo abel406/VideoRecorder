@@ -28,13 +28,8 @@ export default function App() {
 
                         <Group>
                             <ThemeToggle />
-                        </Group>
-                        <Group h="100%" px="md" justify="space-between">
-                            {/*<Group>
-                                */}{/**/}{/*
-                            </Group>*/}
                             <InstallButton />
-                        </Group>
+                        </Group>                        
                     </Group>
             </AppShell.Header>
 
