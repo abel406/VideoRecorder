@@ -1,73 +1,38 @@
-import { useEffect, useState, useCallback } from 'react'
-import { Button } from '@mantine/core'
-import { notifications } from '@mantine/notifications'
+ï»¿import { Button } from '@mantine/core';
+import { notifications } from '@mantine/notifications';
+import { useInstallPrompt } from './useInstallPrompt';
+
+function isFirefoxAndroid() {
+    const ua = navigator.userAgent.toLowerCase();
+    return ua.includes('android') && ua.includes('firefox');
+}
+function isIOSSafari() {
+    const ua = navigator.userAgent;
+    return /iP(hone|ad|od)/.test(ua) && /Safari/.test(ua) && !/CriOS|FxiOS/.test(ua);
+}
 
 export default function InstallButton() {
-    const [canInstall, setCanInstall] = useState(false)
-    const [isStandalone, setIsStandalone] = useState(false)
+    const { deferredPrompt, installed, isStandalone } = useInstallPrompt();
+    if (installed || isStandalone) return null;
 
-    // detect "already installed"
-    useEffect(() => {
-        const standalone =
-            window.matchMedia?.('(display-mode: standalone)').matches ||
-            window.navigator.standalone === true
-        setIsStandalone(standalone)
-    }, [])
-
-    // react to prompt availability + install
-    useEffect(() => {
-        const onAvailable = () => setCanInstall(!!window.deferredInstallPrompt)
-        const onInstalled = () => {
-            notifications.show({ title: 'Installed', message: 'App installed successfully.' })
-            setCanInstall(false)
+    const onClick = async () => {
+        if (deferredPrompt) {
+            deferredPrompt.prompt();
+            await deferredPrompt.userChoice;
+            return;
         }
-
-        // initialize current state
-        onAvailable()
-
-        window.addEventListener('pwa:beforeinstallprompt', onAvailable)
-        window.addEventListener('pwa:installed', onInstalled)
-
-        return () => {
-            window.removeEventListener('pwa:beforeinstallprompt', onAvailable)
-            window.removeEventListener('pwa:installed', onInstalled)
+        if (isFirefoxAndroid()) {
+            notifications.show({ title: 'Install on Firefox', message: 'Tap â‹® â†’ Add to Home screen.' });
+        } else if (isIOSSafari()) {
+            notifications.show({ title: 'Install on iOS', message: 'Share â†’ Add to Home Screen.' });
+        } else {
+            notifications.show({ title: 'Install', message: 'Use your browser menu to install.' });
         }
-    }, [])
-
-    const onClick = useCallback(async () => {
-        const promptEvent = window.deferredInstallPrompt
-        if (!promptEvent) {
-            notifications.show({
-                color: 'yellow',
-                title: 'Not ready yet',
-                message: 'Still preparing install… try again in a moment.',
-            })
-            return
-        }
-
-        try {
-            await promptEvent.prompt()
-            const { outcome } = await promptEvent.userChoice
-            if (outcome === 'accepted') {
-                notifications.show({ title: 'Installing…', message: 'Completing install…' })
-            } else {
-                notifications.show({ color: 'gray', title: 'Install dismissed', message: 'You can install later.' })
-            }
-        } catch (err) {
-            notifications.show({ color: 'red', title: 'Install failed', message: String(err) })
-        } finally {
-            // the saved event can only be used once
-            window.deferredInstallPrompt = null
-            setCanInstall(false)
-        }
-    }, [])
-
-    // Hide if already installed, or if the prompt isn't available
-    if (isStandalone || !canInstall) return null
+    };
 
     return (
-        <Button onClick={onClick} variant="filled">
-            Install app
+        <Button variant="light" onClick={onClick}>
+            {deferredPrompt ? 'Install app' : 'How to install'}
         </Button>
-    )
+    );
 }
