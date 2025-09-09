@@ -1,410 +1,576 @@
-﻿import { useEffect, useRef, useState } from 'react';
-import { Button, Group, Stack, Title, Text, Paper, Badge, Select } from '@mantine/core';
-import { notifications } from '@mantine/notifications';
-import { db } from '../../db/mediaDb';
+﻿import { useEffect, useRef, useState, useCallback } from 'react'
+import { Button, Group, Stack, Title, Text, Paper, Badge, Select } from '@mantine/core'
+import { notifications } from '@mantine/notifications'
+import { db } from '../../db/mediaDb'
+import {
+  isMobileDevice,
+  isStandalone as isStandaloneDisplay,
+  isInstallPromptSupported,
+} from '../utils/device' // <- adjust if needed
 
-const isMobile = () => /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
-const isFirefox = () => /Firefox/i.test(navigator.userAgent);
-
+const normalizeLabel = (label) =>
+    (label || '')
+        .toLowerCase()
+        .replace(/\b(camera|webcam)\b/g, '')
+        .replace(/\s*\(\d+\)\s*$/g, '')   // strip trailing "(2)" etc.
+        .replace(/\s+/g, ' ')
+        .trim()
 const QUALITY_PRESETS = {
-    sd: { label: '480p (SD) ~1.5 Mbps', width: 640, height: 480, vbits: 1_500_000 },
-    hd: { label: '720p (HD) ~3 Mbps', width: 1280, height: 720, vbits: 3_000_000 },
-    fhd: { label: '1080p (FHD) ~6 Mbps', width: 1920, height: 1080, vbits: 6_000_000 },
-    uhd: { label: '2160p (4K) ~16 Mbps', width: 3840, height: 2160, vbits: 16_000_000 },
-};
+  sd: { label: '480p (SD) ~1.5 Mbps', width: 640, height: 480, vbits: 1_500_000 },
+  hd: { label: '720p (HD) ~3 Mbps', width: 1280, height: 720, vbits: 3_000_000 },
+  fhd: { label: '1080p (FHD) ~6 Mbps', width: 1920, height: 1080, vbits: 6_000_000 },
+  uhd: { label: '2160p (4K) ~16 Mbps', width: 3840, height: 2160, vbits: 16_000_000 },
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
 export default function Recorder() {
-    const videoRef = useRef(null);
-    const mediaRecorderRef = useRef(null);
-    const chunksRef = useRef([]);
-    const [stream, setStream] = useState(null);          // null = camera closed
-    const [isRecording, setIsRecording] = useState(false);
-    const [duration, setDuration] = useState(0);
-    const [mimeType, setMimeType] = useState('');
-    const [selectedMime, setSelectedMime] = useState(''); // user selection
-    const timerRef = useRef(null);
+  const videoRef = useRef(null)
+  const mediaRecorderRef = useRef(null)
+  const chunksRef = useRef([])
+  const timerRef = useRef(null)
 
-    // Devices and selections
-    const [videoDevices, setVideoDevices] = useState([]);
-    const [audioDevices, setAudioDevices] = useState([]);
-    const [videoDeviceId, setVideoDeviceId] = useState('');
-    const [audioDeviceId, setAudioDeviceId] = useState('');
-    const [facing, setFacing] = useState('user'); // 'user' | 'environment'
+  const [stream, setStream] = useState(null)
+  const [isRecording, setIsRecording] = useState(false)
+  const [duration, setDuration] = useState(0)
 
-    // Quality
-    const [quality, setQuality] = useState('hd');
+  const [mimeType, setMimeType] = useState('')
+  const [selectedMime, setSelectedMime] = useState('')
 
-    // PWA install helpers (optional)
-    const [deferredPrompt, setDeferredPrompt] = useState(null);
-    const [isStandalone, setIsStandalone] =
-        useState(window.matchMedia?.('(display-mode: standalone)').matches || window.navigator.standalone === true);
+  // discovered devices
+  const [videoDevices, setVideoDevices] = useState([])
+  const [audioDevices, setAudioDevices] = useState([])
 
-    // Whether we can validate cameras (we got permission at least once)
-    const [canValidate, setCanValidate] = useState(false);
+  // proven working cameras (subset)
+  const [workingVideo, setWorkingVideo] = useState([]) // [{deviceId,label,facing:null|'user'|'environment'}]
+  const [probing, setProbing] = useState(false)
 
-    useEffect(() => {
-        const onBIP = (e) => { e.preventDefault(); setDeferredPrompt(e); };
-        window.addEventListener('beforeinstallprompt', onBIP);
+  const [videoDeviceId, setVideoDeviceId] = useState('')
+  const [audioDeviceId, setAudioDeviceId] = useState('')
+  const [quality, setQuality] = useState('hd')
 
-        const mql = window.matchMedia?.('(display-mode: standalone)');
-        const onChange = () => setIsStandalone(mql.matches);
-        mql?.addEventListener?.('change', onChange);
+  useEffect(() => {
+    computeSupportedFormats()
+    refreshDevices()
+    const onDevChange = () => refreshDevices()
+    navigator.mediaDevices?.addEventListener?.('devicechange', onDevChange)
+    return () => {
+      stopRecording()
+      closeCameraSync()
+      clearInterval(timerRef.current)
+      navigator.mediaDevices?.removeEventListener?.('devicechange', onDevChange)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
 
-        // Precompute supported formats
-        computeSupportedFormats();
+  const computeSupportedFormats = () => {
+    const candidates = [
+      'video/webm;codecs=vp9,opus',
+      'video/webm;codecs=vp8,opus',
+      'video/webm',
+      'video/mp4;codecs=h264,aac',
+      'video/mp4',
+    ]
+    const supported = candidates.filter(
+      (t) =>
+        window.MediaRecorder &&
+        typeof MediaRecorder.isTypeSupported === 'function' &&
+        MediaRecorder.isTypeSupported(t)
+    )
+    setMimeType(supported[0] || 'video/webm')
+    setSelectedMime(supported[0] || 'video/webm')
+  }
 
-        // Try to list devices (labels appear after permission)
-        refreshDevices();
+  const deviceOptions = (list) =>
+    list.map((d, i) => ({
+      value: d.deviceId,
+      label: d.label || (d.kind === 'videoinput' ? `Camera ${i + 1}` : `Mic ${i + 1}`),
+    }))
 
-        // Keep device list updated
-        const onDevChange = () => refreshDevices();
-        navigator.mediaDevices?.addEventListener?.('devicechange', onDevChange);
+  const labelFacing = (label) => {
+    if (!label) return null
+    const s = label.toLowerCase()
+    if (/(back|rear|environment)/.test(s)) return 'environment'
+    if (/(front|user|selfie)/.test(s)) return 'user'
+    return null
+  }
 
-        return () => {
-            stopRecording();
-            closeCamera();
-            clearInterval(timerRef.current);
-            window.removeEventListener('beforeinstallprompt', onBIP);
-            navigator.mediaDevices?.removeEventListener?.('devicechange', onDevChange);
-            mql?.removeEventListener?.('change', onChange);
-        };
-        // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, []);
+  const facingFromTrack = (track) => {
+    try {
+      const fm = track.getSettings?.().facingMode
+      if (fm === 'environment' || fm === 'user') return fm
+    } catch {}
+    return null
+  }
 
-    const computeSupportedFormats = () => {
-        const candidates = [
-            'video/webm;codecs=vp9,opus',
-            'video/webm;codecs=vp8,opus',
-            'video/webm',
-            'video/mp4;codecs=h264,aac',
-            'video/mp4',
-        ];
-        const supported = candidates.filter(
-            (t) => window.MediaRecorder && typeof MediaRecorder.isTypeSupported === 'function' && MediaRecorder.isTypeSupported(t)
-        );
-        // Set defaults
-        setMimeType(supported[0] || 'video/webm');
-        setSelectedMime(supported[0] || 'video/webm');
-    };
+    const probeWorkingVideoDevices = useCallback(async (vids) => {
+        setProbing(true)
+        const found = []
 
-    const deviceOptions = (list) =>
-        list.map((d, i) => ({
-            value: d.deviceId,
-            label: d.label || (d.kind === 'videoinput' ? `Camera ${i + 1}` : `Mic ${i + 1}`),
-        }));
-
-    const refreshDevices = async () => {
-        if (!navigator.mediaDevices?.enumerateDevices) return;
-
-        // If we never asked permission, labels may be blank; do a quick one-shot open/close
-        if (!canValidate) {
+        for (const d of vids) {
             try {
-                const tmp = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
-                tmp.getTracks().forEach((t) => t.stop());
-                setCanValidate(true);
+                const s = await navigator.mediaDevices.getUserMedia({
+                    video: { deviceId: { exact: d.deviceId } },
+                    audio: false,
+                })
+                const track = s.getVideoTracks()[0]
+                const settings = track?.getSettings?.() || {}
+                const facing = (settings.facingMode === 'environment' || settings.facingMode === 'user')
+                    ? settings.facingMode
+                    : labelFacing(d.label)
+
+                found.push({
+                    deviceId: d.deviceId,
+                    label: d.label,
+                    facing: facing || null,
+                    groupId: settings.groupId || d.groupId || '',   // key for dedup
+                })
+
+                s.getTracks().forEach(t => t.stop())
             } catch {
-                // ignore; user will grant when opening camera
+                // skip device that fails to open
             }
         }
 
-        const devices = await navigator.mediaDevices.enumerateDevices();
-        // Filter videoinputs: drop 'default'/'communications' and dedupe by label
-        let vids = devices.filter((d) => d.kind === 'videoinput' && d.deviceId && !['default', 'communications'].includes(d.deviceId));
-        if (isMobile()) {
-            // Prefer “real” cameras by label hints on mobile
-            const keywords = ['front', 'back', 'rear', 'user', 'environment', 'wide', 'ultra', 'tele', 'camera'];
-            const hinted = vids.filter((d) => d.label && keywords.some((k) => d.label.toLowerCase().includes(k)));
-            vids = hinted.length ? hinted : vids;
+        // ---- DEDUPE: keep one per (facing, group) or (facing, normalized label) ----
+        const seen = new Set()
+        const deduped = []
+        for (const cam of found) {
+            const key =
+                `${cam.facing || 'unknown'}::${cam.groupId || normalizeLabel(cam.label) || cam.deviceId}`
+            if (seen.has(key)) continue
+            seen.add(key)
+            deduped.push(cam)
         }
-        // Deduplicate by (label || deviceId)
-        const seen = new Set();
-        vids = vids.filter((d) => {
-            const key = d.label || d.deviceId;
-            if (seen.has(key)) return false;
-            seen.add(key);
-            return true;
-        });
+        // ---------------------------------------------------------------------------
 
-        // Optional: actively validate each camera (after permission) by opening+closing it
-        if (canValidate && vids.length <= 4) {
-            const ok = [];
-            for (const d of vids) {
-                try {
-                    const test = await navigator.mediaDevices.getUserMedia({ video: { deviceId: { exact: d.deviceId } }, audio: false });
-                    test.getTracks().forEach((t) => t.stop());
-                    ok.push(d);
-                } catch {
-                    // skip unusable camera
-                }
-            }
-            vids = ok;
+        setWorkingVideo(deduped)
+
+        // choose a sensible default
+        if (!videoDeviceId && deduped[0]) {
+            // prefer back camera on mobile, otherwise first
+            const preferred =
+                (isMobileDevice?.() && deduped.find(c => c.facing === 'environment')) || deduped[0]
+            setVideoDeviceId(preferred.deviceId)
         }
+        setProbing(false)
+    }, [videoDeviceId])
 
-        const auds = devices.filter((d) => d.kind === 'audioinput' && d.deviceId && !['default', 'communications'].includes(d.deviceId));
 
-        setVideoDevices(vids);
-        setAudioDevices(auds);
+  const refreshDevices = async () => {
+    if (!navigator.mediaDevices?.enumerateDevices) return
 
-        if (!videoDeviceId && vids[0]) setVideoDeviceId(vids[0].deviceId);
-        if (!audioDeviceId && auds[0]) setAudioDeviceId(auds[0].deviceId);
-    };
+    // Try once so labels populate (only when we have no permission yet)
+    try {
+      const tmp = await navigator.mediaDevices.getUserMedia({ video: true, audio: true })
+      tmp.getTracks().forEach((t) => t.stop())
+    } catch {
+      // ignore
+    }
 
-    const buildConstraints = () => {
-        const q = QUALITY_PRESETS[quality] || QUALITY_PRESETS.hd;
-        const baseVideo = {
-            width: { ideal: q.width },
-            height: { ideal: q.height },
-            frameRate: { ideal: 30, max: 60 },
-        };
-        const video = videoDeviceId
-            ? { ...baseVideo, deviceId: { exact: videoDeviceId } }
-            : { ...baseVideo, facingMode: { ideal: facing } };
-        const audio = audioDeviceId ? { deviceId: { exact: audioDeviceId } } : true;
-        return { video, audio };
-    };
+    const devices = await navigator.mediaDevices.enumerateDevices()
+    let vids = devices.filter(
+      (d) => d.kind === 'videoinput' && d.deviceId && !['default', 'communications'].includes(d.deviceId)
+    )
 
-    const openCamera = async () => {
+    // dedupe by label/deviceId
+    const seen = new Set()
+    vids = vids.filter((d) => {
+      const key = d.label || d.deviceId
+      if (seen.has(key)) return false
+      seen.add(key)
+      return true
+    })
+    setVideoDevices(vids)
+
+    const auds = devices.filter(
+      (d) => d.kind === 'audioinput' && d.deviceId && !['default', 'communications'].includes(d.deviceId)
+    )
+    setAudioDevices(auds)
+    if (!audioDeviceId && auds[0]) setAudioDeviceId(auds[0].deviceId)
+
+    await probeWorkingVideoDevices(vids)
+  }
+
+  const audioOrDefault = () => (audioDeviceId ? { deviceId: { exact: audioDeviceId } } : true)
+
+  const buildConstraints = (videoIdOverride) => {
+    const q = QUALITY_PRESETS[quality] || QUALITY_PRESETS.hd
+    const baseVideo = {
+      width: { ideal: q.width },
+      height: { ideal: q.height },
+      frameRate: { ideal: 30, max: 60 },
+    }
+    const id = videoIdOverride || videoDeviceId
+    return id
+      ? { video: { ...baseVideo, deviceId: { exact: id } }, audio: audioOrDefault() }
+      : { video: baseVideo, audio: audioOrDefault() }
+  }
+
+  const explainGetUserMediaError = (err) => {
+    const name = err?.name || 'Error'
+    let hint = ''
+    switch (name) {
+      case 'NotAllowedError':
+        hint = 'Permission denied. Check Site permissions (Camera & Microphone → Allow).'
+        break
+      case 'NotFoundError':
+        hint = 'No camera found for the selected device.'
+        break
+      case 'NotReadableError':
+        hint = 'Camera is busy. Wait a moment after closing before switching.'
+        break
+      case 'OverconstrainedError':
+        hint = 'Requested constraints not supported by this camera.'
+        break
+      case 'SecurityError':
+        hint = 'Secure context required. Use HTTPS with a trusted certificate.'
+        break
+      default:
+        hint = 'Unexpected camera error.'
+    }
+    notifications.show({
+      color: 'red',
+      title: `${name}`,
+      message: `${hint} Details: ${err?.message || String(err)}`,
+      autoClose: 5000,
+    })
+  }
+
+  // Open with fallbacks + one retry for "busy" camera
+  const tryOpenWithFallbacks = async (videoIdOverride) => {
+  const q = QUALITY_PRESETS[quality] || QUALITY_PRESETS.hd
+  const id = videoIdOverride || videoDeviceId
+
+  const attempt = (config) => navigator.mediaDevices.getUserMedia(config)
+
+  try {
+    // 1) id + resolution
+    return await attempt(buildConstraints(id))
+  } catch (e1) {
+    if (id) {
+      try {
+        // 2) id only (no width/height/framerate)
+        return await attempt({ video: { deviceId: { exact: id } }, audio: audioOrDefault() })
+      } catch (e2) {
+
+        // === ADD THIS MOBILE FACINGMODE FALLBACK ===
+        if (isMobileDevice()) {
+          const desiredFacing =
+            workingVideo.find(d => d.deviceId === id)?.facing || 'environment'
+          try {
+            return await attempt({
+              video: {
+                width: { ideal: q.width },
+                height: { ideal: q.height },
+                facingMode: { ideal: desiredFacing },
+              },
+              audio: audioOrDefault(),
+            })
+          } catch (e3) {
+            // continue to final fallback
+          }
+        }
+        // ===========================================
+
+        // 3) final fallback: plain video:true (+ retry if busy)
         try {
-            const s = await navigator.mediaDevices.getUserMedia(buildConstraints());
-            setStream(s);
-            if (videoRef.current) {
-                videoRef.current.srcObject = s;
-                await videoRef.current.play();
-            }
-            // After permission, refresh to get labels
-            await refreshDevices();
-        } catch (err) {
-            notifications.show({ color: 'red', title: 'Camera error', message: String(err) });
+          return await attempt({ video: true, audio: audioOrDefault() })
+        } catch (e4) {
+          if (e2?.name === 'NotReadableError' || e1?.name === 'NotReadableError') {
+            await sleep(250)
+            return await attempt({ video: true, audio: audioOrDefault() })
+          }
+          throw e1
         }
-    };
-
-    const closeCamera = () => {
-        if (isRecording) return; // avoid breaking a recording
-        if (stream) {
-            stream.getTracks().forEach((t) => t.stop());
-            setStream(null);
-            if (videoRef.current) videoRef.current.srcObject = null;
+      }
+    } else {
+      // initial open without an explicit id
+      // (optional: you can also try facingMode: 'environment' here on mobile)
+      try {
+        return await attempt(buildConstraints())
+      } catch {
+        if (isMobileDevice()) {
+          try {
+            return await attempt({
+              video: {
+                width: { ideal: q.width },
+                height: { ideal: q.height },
+                facingMode: { ideal: 'environment' },
+              },
+              audio: audioOrDefault(),
+            })
+          } catch {}
         }
-    };
+        return await attempt({ video: true, audio: audioOrDefault() })
+      }
+    }
+  }
+}
 
-    const startRecording = async () => {
+  const openCamera = async (videoIdOverride) => {
+    try {
+      const s = await tryOpenWithFallbacks(videoIdOverride)
+      setStream(s)
+      if (videoRef.current) {
+        videoRef.current.srcObject = s
+        await videoRef.current.play()
+      }
+    } catch (err) {
+      explainGetUserMediaError(err)
+    }
+  }
+
+  // Close camera and wait a tiny bit to release hardware (Android/Firefox needs this)
+  const closeCameraAsync = async () => {
+    if (isRecording) return
+    if (stream) {
+      stream.getTracks().forEach((t) => t.stop())
+      setStream(null)
+      if (videoRef.current) videoRef.current.srcObject = null
+      await sleep(200)
+    }
+  }
+  const closeCameraSync = () => {
+    if (isRecording) return
+    if (stream) {
+      stream.getTracks().forEach((t) => t.stop())
+      setStream(null)
+      if (videoRef.current) videoRef.current.srcObject = null
+    }
+  }
+
+  const startRecording = async () => {
+    try {
+      let s = stream
+      if (!s) {
+        await openCamera(videoDeviceId)
+        s = videoRef.current?.srcObject || null
+        if (!s) throw new Error('No media stream available')
+      }
+
+      const q = QUALITY_PRESETS[quality] || QUALITY_PRESETS.hd
+      const wanted = selectedMime || mimeType || ''
+      const typeToUse =
+        wanted && window.MediaRecorder?.isTypeSupported?.(wanted) ? wanted : pickMimeTypeFallback()
+      setMimeType(typeToUse || 'video/webm')
+      chunksRef.current = []
+
+      const mr = new MediaRecorder(s, {
+        ...(typeToUse ? { mimeType: typeToUse } : {}),
+        videoBitsPerSecond: q.vbits,
+        audioBitsPerSecond: 128_000,
+      })
+      mediaRecorderRef.current = mr
+
+      mr.ondataavailable = (e) => {
+        if (e.data && e.data.size > 0) chunksRef.current.push(e.data)
+      }
+
+      mr.onstop = async () => {
         try {
-            const q = QUALITY_PRESETS[quality] || QUALITY_PRESETS.hd;
-
-            // Ensure we have a stream (preview opened). If not, open with current constraints.
-            let s = stream;
-            if (!s) {
-                s = await navigator.mediaDevices.getUserMedia(buildConstraints());
-                setStream(s);
-                if (videoRef.current) {
-                    videoRef.current.srcObject = s;
-                    await videoRef.current.play();
-                }
-            }
-
-            const wanted = selectedMime || mimeType || '';
-            const typeToUse = wanted && window.MediaRecorder?.isTypeSupported?.(wanted) ? wanted : pickMimeTypeFallback();
-            setMimeType(typeToUse || 'video/webm');
-            chunksRef.current = [];
-
-            const mrOpts = typeToUse
-                ? { mimeType: typeToUse, videoBitsPerSecond: q.vbits, audioBitsPerSecond: 128_000 }
-                : { videoBitsPerSecond: q.vbits, audioBitsPerSecond: 128_000 };
-            const mr = new MediaRecorder(s, mrOpts);
-            mediaRecorderRef.current = mr;
-
-            mr.ondataavailable = (e) => {
-                if (e.data && e.data.size > 0) chunksRef.current.push(e.data);
-            };
-
-            mr.onstop = async () => {
-                try {
-                    const blob = new Blob(chunksRef.current, { type: typeToUse || 'video/webm' });
-                    const createdAt = new Date();
-                    const durationSeconds = duration;
-                    await db.recordings.add({
-                        createdAt,
-                        mimeType: blob.type,
-                        bytes: blob.size,
-                        durationSeconds,
-                        blob,
-                    });
-                    notifications.show({ title: 'Saved', message: 'Recording saved to Library', autoClose: 2000 });
-                } catch (err) {
-                    notifications.show({ color: 'red', title: 'Save failed', message: String(err) });
-                } finally {
-                    setDuration(0);
-                }
-            };
-
-            mr.start(250);
-            setIsRecording(true);
-            timerRef.current = setInterval(() => setDuration((d) => d + 1), 1000);
+          const blob = new Blob(chunksRef.current, { type: typeToUse || 'video/webm' })
+          await db.recordings.add({
+            createdAt: new Date(),
+            mimeType: blob.type,
+            bytes: blob.size,
+            durationSeconds: duration,
+            blob,
+          })
+          notifications.show({ title: 'Saved', message: 'Recording saved to Library', autoClose: 2000 })
         } catch (err) {
-            notifications.show({ color: 'red', title: 'Permission / device error', message: String(err) });
+          notifications.show({ color: 'red', title: 'Save failed', message: String(err) })
+        } finally {
+          setDuration(0)
         }
-    };
+      }
 
-    const stopRecording = () => {
-        if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
-            mediaRecorderRef.current.stop();
-        }
-        setIsRecording(false);
-        clearInterval(timerRef.current);
-    };
+      mr.start(250)
+      setIsRecording(true)
+      timerRef.current = setInterval(() => setDuration((d) => d + 1), 1000)
+    } catch (err) {
+      notifications.show({ color: 'red', title: 'Permission / device error', message: String(err) })
+    }
+  }
 
-    const flipCamera = async () => {
-        if (isRecording) return;
-        if (videoDeviceId) return; // when a specific device is chosen, flip is disabled
-        setFacing((f) => (f === 'user' ? 'environment' : 'user'));
-        if (stream) {
-            closeCamera();
-            await openCamera();
-        }
-    };
+  const stopRecording = () => {
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
+      mediaRecorderRef.current.stop()
+    }
+    setIsRecording(false)
+    clearInterval(timerRef.current)
+  }
 
-    const pickMimeTypeFallback = () => {
-        const candidates = ['video/webm;codecs=vp9,opus', 'video/webm;codecs=vp8,opus', 'video/webm'];
-        for (const t of candidates) {
-            if (window.MediaRecorder && MediaRecorder.isTypeSupported(t)) return t;
-        }
-        return '';
-    };
+  // Flip: if preview open, close+delay+open with the other device; if closed, just switch selection
+  const flipCamera = async () => {
+    if (isRecording) return
+    if (!workingVideo.length) return
 
-    const format = (s) => {
-        const mm = String(Math.floor(s / 60)).padStart(2, '0');
-        const ss = String(s % 60).padStart(2, '0');
-        return `${mm}:${ss}`;
-    };
+    const idx = Math.max(0, workingVideo.findIndex((d) => d.deviceId === videoDeviceId))
+    const cur = workingVideo[idx]
+    let targetId = ''
 
-    const install = async () => {
-        if (deferredPrompt) {
-            deferredPrompt.prompt();
-            await deferredPrompt.userChoice;
-            setDeferredPrompt(null);
-        } else if (isFirefox()) {
-            notifications.show({
-                title: 'Install on Firefox',
-                message: 'Open the ⋮ menu → Add to Home screen (or Install).',
-            });
-        } else {
-            notifications.show({
-                title: 'Install',
-                message: 'Use your browser menu → Install app / Add to Home Screen.',
-            });
-        }
-    };
+    if (cur?.facing && workingVideo.some((d) => d.facing && d.facing !== cur.facing)) {
+      const opposite = workingVideo.find((d) => d.facing && d.facing !== cur.facing)
+      targetId = opposite?.deviceId || ''
+    } else {
+      const next = workingVideo[(idx + 1) % workingVideo.length]
+      targetId = next?.deviceId || ''
+    }
+    if (!targetId || targetId === videoDeviceId) return
 
-    // Build selects
-    const mimeOptions = (['video/webm;codecs=vp9,opus', 'video/webm;codecs=vp8,opus', 'video/webm', 'video/mp4;codecs=h264,aac', 'video/mp4']
-        .filter((t) => window.MediaRecorder && MediaRecorder.isTypeSupported?.(t))
-        .map((t) => ({ value: t, label: t })));
+    setVideoDeviceId(targetId)
 
-    const qualityOptions = Object.entries(QUALITY_PRESETS).map(([k, v]) => ({ value: k, label: v.label }));
+    if (stream) {
+      await closeCameraAsync()
+      await openCamera(targetId)
+    }
+  }
 
-    return (
-        <Stack gap="md">
-            <Group justify="space-between">
-                <Title order={2}>Record a video</Title>
-                {!isStandalone && (
-                    <Button variant="light" onClick={install}>
-                        Install
-                    </Button>
-                )}
-            </Group>
+  const pickMimeTypeFallback = () => {
+    const candidates = ['video/webm;codecs=vp9,opus', 'video/webm;codecs=vp8,opus', 'video/webm']
+    for (const t of candidates) {
+      if (window.MediaRecorder && MediaRecorder.isTypeSupported(t)) return t
+    }
+    return ''
+  }
 
-            <Paper p="md" radius="lg" withBorder>
-                <Stack gap="sm" align="center">
-                    {/* Format & Quality */}
-                    <Group w="100%" grow>
-                        <Select
-                            label="Video format"
-                            data={mimeOptions}
-                            value={selectedMime}
-                            onChange={(v) => setSelectedMime(v || '')}
-                            placeholder="Choose format"
-                            withinPortal
-                        />
-                        <Select
-                            label="Quality"
-                            data={qualityOptions}
-                            value={quality}
-                            onChange={(v) => setQuality(v || 'hd')}
-                            placeholder="Select quality"
-                            withinPortal
-                        />
-                    </Group>
+  const format = (s) => {
+    const mm = String(Math.floor(s / 60)).padStart(2, '0')
+    const ss = String(s % 60).padStart(2, '0')
+    return `${mm}:${ss}`
+  }
 
-                    {/* Device pickers */}
-                    <Group w="100%" grow>
-                        <Select
-                            label="Camera"
-                            placeholder={videoDevices.length ? 'Select camera' : 'Grant permission to list cameras'}
-                            data={deviceOptions(videoDevices)}
-                            value={videoDeviceId}
-                            onChange={(v) => setVideoDeviceId(v || '')}
-                            disabled={isRecording}
-                            allowDeselect
-                            clearable
-                            withinPortal
-                        />
-                        <Select
-                            label="Microphone"
-                            placeholder={audioDevices.length ? 'Select mic' : 'Grant permission to list mics'}
-                            data={deviceOptions(audioDevices)}
-                            value={audioDeviceId}
-                            onChange={(v) => setAudioDeviceId(v || '')}
-                            disabled={isRecording}
-                            allowDeselect
-                            clearable
-                            withinPortal
-                        />
-                    </Group>
+    const workingOptions = workingVideo.map((d, i) => ({
+        value: d.deviceId,
+        label:
+            d.label
+                ? d.label
+                : d.facing === 'user'
+                    ? `Front camera ${i + 1}`
+                    : d.facing === 'environment'
+                        ? `Back camera ${i + 1}`
+                        : `Camera ${i + 1}`,
+    }))
 
-                    <video
-                        ref={videoRef}
-                        autoPlay
-                        muted
-                        playsInline
-                        style={{ width: '100%', maxWidth: 640, borderRadius: 16, background: '#000' }}
-                    />
+  const qualityOptions = Object.entries(QUALITY_PRESETS).map(([k, v]) => ({
+    value: k,
+    label: v.label,
+  }))
 
-                    <Group gap="md">
-                        {/* Open/Close camera */}
-                        <Button onClick={openCamera} disabled={!!stream || isRecording}>
-                            Open camera
-                        </Button>
-                        <Button variant="default" onClick={closeCamera} disabled={!stream || isRecording}>
-                            Close camera
-                        </Button>
+  const flipDisabled = isRecording || workingVideo.length < 2
+  const flipTitle = workingVideo.length < 2 ? 'Only one usable camera detected' : 'Flip front/back camera'
 
-                        {/* Record controls */}
-                        <Button onClick={startRecording} disabled={isRecording}>
-                            Start recording
-                        </Button>
-                        <Button onClick={stopRecording} color="red" disabled={!isRecording}>
-                            Stop & Save
-                        </Button>
+  return (
+    <Stack gap="md">
+      <Group justify="space-between">
+        <Title order={2}>Record a video</Title>
+        {!isStandaloneDisplay() && !isInstallPromptSupported() && (
+          <Text size="sm" c="dimmed">On Safari: Share → Add to Home Screen</Text>
+        )}
+      </Group>
 
-                        {/* Flip only when not locked to a deviceId */}
-                        <Button
-                            variant="default"
-                            onClick={flipCamera}
-                            disabled={!!videoDeviceId || isRecording}
-                            title={videoDeviceId ? 'Clear camera selection to enable flip' : 'Flip front/back camera'}
-                        >
-                            Flip camera
-                        </Button>
+      <Paper p="md" radius="lg" withBorder>
+        <Stack gap="sm" align="center">
+          {/* Format & Quality */}
+          <Group w="100%" grow>
+            <Select
+              label="Video format"
+              data={[
+                'video/webm;codecs=vp9,opus',
+                'video/webm;codecs=vp8,opus',
+                'video/webm',
+                'video/mp4;codecs=h264,aac',
+                'video/mp4',
+              ]
+                .filter((t) => window.MediaRecorder && MediaRecorder.isTypeSupported?.(t))
+                .map((t) => ({ value: t, label: t }))}
+              value={selectedMime}
+              onChange={(v) => setSelectedMime(v || '')}
+              placeholder="Choose format"
+              withinPortal
+            />
+            <Select
+              label="Quality"
+              data={qualityOptions}
+              value={quality}
+              onChange={(v) => setQuality(v || 'hd')}
+              placeholder="Select quality"
+              withinPortal
+            />
+          </Group>
 
-                        <Badge variant="light">{selectedMime || mimeType || 'format auto'}</Badge>
-                        <Text>⏱ {format(duration)}</Text>
-                    </Group>
+          {/* Device pickers */}
+          <Group w="100%" grow>
+            <Select
+              label={probing ? 'Camera (testing…)' : 'Camera'}
+              placeholder={
+                workingOptions.length
+                  ? 'Select camera'
+                  : probing
+                  ? 'Testing cameras…'
+                  : 'Grant permission to list cameras'
+              }
+              data={workingOptions}
+              value={videoDeviceId}
+              onChange={(v) => {
+                // Only set selection; DO NOT auto-open. User clicks "Open camera".
+                setVideoDeviceId(v || '')
+              }}
+              disabled={isRecording}
+              allowDeselect
+              clearable
+              withinPortal
+            />
+            <Select
+              label="Microphone"
+              placeholder={audioDevices.length ? 'Select mic' : 'Grant permission to list mics'}
+              data={deviceOptions(audioDevices)}
+              value={audioDeviceId}
+              onChange={(v) => setAudioDeviceId(v || '')}
+              disabled={isRecording}
+              allowDeselect
+              clearable
+              withinPortal
+            />
+          </Group>
 
-                    <Text size="sm" c="dimmed">
-                        Tip: Camera is closed by default. Open it to preview, then start recording. On mobile, only usable cameras are shown.
-                    </Text>
-                </Stack>
-            </Paper>
+          <video
+            ref={videoRef}
+            autoPlay
+            muted
+            playsInline
+            style={{ width: '100%', maxWidth: 640, borderRadius: 16, background: '#000' }}
+          />
+
+          <Group gap="md">
+            <Button onClick={() => openCamera(videoDeviceId)} disabled={!!stream || isRecording}>
+              Open camera
+            </Button>
+            <Button variant="default" onClick={closeCameraAsync} disabled={!stream || isRecording}>
+              Close camera
+            </Button>
+
+            <Button onClick={startRecording} disabled={isRecording}>
+              Start recording
+            </Button>
+            <Button onClick={stopRecording} color="red" disabled={!isRecording}>
+              Stop &amp; Save
+            </Button>
+
+            <Button variant="default" onClick={flipCamera} disabled={flipDisabled} title={flipTitle}>
+              Flip camera
+            </Button>
+
+            <Badge variant="light">{selectedMime || mimeType || 'format auto'}</Badge>
+            <Text>⏱ {format(duration)}</Text>
+          </Group>
+
+          <Text size="sm" c="dimmed">
+            Tip: after closing the camera, wait a half second before switching devices on some Android/Firefox phones.
+          </Text>
         </Stack>
-    );
+      </Paper>
+    </Stack>
+  )
 }
