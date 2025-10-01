@@ -1,0 +1,31 @@
+﻿# --- JetBrains / IntelliJ IDEA ---
+# Ignore everything in .idea by default
+.idea/*
+
+# Keep only shareable settings (and their contents)
+!.idea/codeStyles/
+!.idea/codeStyles/**
+!.idea/inspectionProfiles/
+!.idea/inspectionProfiles/**
+!.idea/runConfigurations/
+!.idea/runConfigurations/**
+
+# Always ignore volatile IDE files (even inside kept dirs)
+.idea/workspace.xml
+.idea/tasks.xml
+.idea/usage.statistics.xml
+.idea/dictionaries/
+.idea/shelf/
+.idea/httpRequests/
+.idea/dataSources/
+.idea/dataSources.local.xml
+.idea/aws.xml
+.idea/encodings.xml
+.idea/indexLayout.xml
+.idea/vcs.xml
+.idea/contentModel.xml
+.idea/modules.xml
+.idea/projectSettingsUpdater.xml
+
+# Module files created at repo root (covers ".idea.VideoRecorder.iml" etc.)
+*.iml
